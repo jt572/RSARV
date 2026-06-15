@@ -1,14 +1,30 @@
 import argparse
 import logging
 import os
+import threading
 import time
 from datetime import datetime, timedelta
 
 from dotenv import load_dotenv
 load_dotenv()
 
+from flask import Flask, request, jsonify
 import ghl
 import rentcast
+import chatarv
+
+WEIGHT_CHATARV   = 0.50
+WEIGHT_RENTCAST  = 0.10
+# BatchData weight (0.40) activates when BatchData API is integrated
+
+app = Flask(__name__)
+_field_map_cache = {}
+
+
+def get_field_map():
+    if not _field_map_cache:
+        _field_map_cache.update(ghl.ensure_custom_fields())
+    return _field_map_cache
 
 logging.basicConfig(
     level=logging.INFO,
@@ -17,46 +33,110 @@ logging.basicConfig(
 )
 
 
+def blend_arv(chatarv_result: dict | None, rc_result: dict | None) -> dict:
+    """Blend ChatARV and RentCast into a single ARV result."""
+    sources = {}
+    if chatarv_result and chatarv_result.get("arv"):
+        sources["ChatARV"] = {"arv": chatarv_result["arv"], "weight": WEIGHT_CHATARV, "confidence": chatarv_result.get("confidence")}
+    if rc_result and rc_result.get("balanced"):
+        sources["RentCast"] = {"arv": rc_result["balanced"], "weight": WEIGHT_RENTCAST, "confidence": None}
+
+    if not sources:
+        return {"blended": None, "conservative": None, "balanced": None, "aggressive": None, "confidence_note": "No data", "sources": {}, "top_comps": []}
+
+    total_weight = sum(s["weight"] for s in sources.values())
+    blended = sum(s["arv"] * s["weight"] for s in sources.values()) / total_weight
+    blended = round(blended / 1000) * 1000
+
+    # Use RentCast tiers for conservative/aggressive spread if available
+    if rc_result and rc_result.get("conservative"):
+        spread = (rc_result["aggressive"] - rc_result["conservative"]) / 2
+        conservative = round((blended - spread) / 1000) * 1000
+        aggressive = round((blended + spread) / 1000) * 1000
+    else:
+        conservative = round(blended * 0.93 / 1000) * 1000
+        aggressive = round(blended * 1.07 / 1000) * 1000
+
+    confidence_parts = []
+    if "ChatARV" in sources:
+        confidence_parts.append(f"ChatARV {int(sources['ChatARV']['confidence'] or 0)}%")
+    source_names = " + ".join(sources.keys())
+    confidence_note = f"Blended ({source_names})" + (f" | {', '.join(confidence_parts)}" if confidence_parts else "")
+
+    top_comps = []
+    if chatarv_result and chatarv_result.get("top_comps"):
+        top_comps = chatarv_result["top_comps"]
+    elif rc_result and rc_result.get("top_comps"):
+        top_comps = rc_result["top_comps"]
+
+    return {
+        "blended": blended,
+        "conservative": conservative,
+        "balanced": blended,
+        "aggressive": aggressive,
+        "confidence_note": confidence_note,
+        "sources": sources,
+        "top_comps": top_comps,
+        "chatarv_arv": sources.get("ChatARV", {}).get("arv"),
+        "chatarv_confidence": sources.get("ChatARV", {}).get("confidence"),
+        "rentcast_arv": sources.get("RentCast", {}).get("arv"),
+    }
+
+
 def run_one_address(address: str, repairs: float = None, fee: float = None):
     print(f"\nRunning comps for: {address}")
-    data, status = rentcast.get_avm(address)
-    if status == "not_found":
-        print("RentCast has no record for this address (404).")
-        return
-    if status == "quota":
-        print("RentCast quota exhausted (429). Try again later.")
-        return
 
-    result, err = rentcast.compute_arv(data)
-    if err:
-        print(f"Error: {err}")
-        return
+    rc_data, rc_status = rentcast.get_avm(address)
+    rc_result = None
+    if rc_status == "ok":
+        rc_result, _ = rentcast.compute_arv(rc_data)
+    elif rc_status == "quota":
+        print("RentCast quota exhausted.")
+    elif rc_status == "not_found":
+        print("RentCast: address not found.")
 
-    print(f"\nSubject sqft : {result['subject_sqft']}")
-    print(f"Conservative : ${result['conservative']:,}")
-    print(f"Balanced     : ${result['balanced']:,}")
-    print(f"Aggressive   : ${result['aggressive']:,}")
-    print(f"Confidence   : {result['confidence']}")
-    if result["top_comps"]:
+    print("  Calling ChatARV (up to 60s)...")
+    ca_data, ca_status = chatarv.get_comps(address)
+    ca_result = None
+    if ca_status == "ok":
+        ca_result = chatarv.extract_arv(ca_data)
+    elif ca_status == "quota":
+        print("ChatARV quota exhausted.")
+    elif ca_status == "not_found":
+        print("ChatARV: address not found.")
+
+    blended = blend_arv(ca_result, rc_result)
+
+    print(f"\nSubject sqft : {(rc_result or {}).get('subject_sqft', 'N/A')}")
+    print(f"Conservative : ${blended['conservative']:,}" if blended['conservative'] else "Conservative : N/A")
+    print(f"Balanced     : ${blended['balanced']:,}" if blended['balanced'] else "Balanced     : N/A")
+    print(f"Aggressive   : ${blended['aggressive']:,}" if blended['aggressive'] else "Aggressive   : N/A")
+    print(f"Confidence   : {blended['confidence_note']}")
+    if ca_result:
+        print(f"\nChatARV ARV  : ${ca_result['arv']:,} (confidence {ca_result['confidence']}%)")
+        print(f"ChatARV note : {ca_result['feedback'][:120]}")
+    if rc_result:
+        print(f"RentCast ARV : ${rc_result['balanced']:,}")
+    if blended["top_comps"]:
         print("\nTop Comps:")
-        for line in result["top_comps"]:
+        for line in blended["top_comps"]:
             print(f"  {line}")
 
     if repairs is not None and fee is not None:
-        balanced = result["balanced"] or 0
-        mao = balanced * 0.70 - repairs - fee
-        print(f"\nMAO (balanced ARV x 0.70 - repairs - fee): ${mao:,.0f}")
+        bal = blended["balanced"] or 0
+        mao = bal * 0.70 - repairs - fee
+        print(f"\nMAO (blended ARV x 0.70 - repairs - fee): ${mao:,.0f}")
 
 
-def write_results_to_opp(opp_id: str, result: dict, field_map: dict):
+def write_results_to_opp(opp_id: str, blended: dict, field_map: dict):
     today = datetime.utcnow().strftime("%Y-%m-%d")
     updates = [
-        {"id": field_map["ARV Conservative"], "field_value": result["conservative"]},
-        {"id": field_map["ARV Balanced"], "field_value": result["balanced"]},
-        {"id": field_map["ARV Aggressive"], "field_value": f"${result['aggressive']:,}"},
-        {"id": field_map["Top Sold Comps"], "field_value": "\n".join(result["top_comps"])},
-        {"id": field_map["Comp Confidence"], "field_value": result["confidence"]},
-        {"id": field_map["Comps Run Date"], "field_value": today},
+        {"id": field_map["ARV Conservative"], "field_value": blended["conservative"]},
+        {"id": field_map["ARV Balanced"],     "field_value": blended["balanced"]},
+        {"id": field_map["ARV Aggressive"],   "field_value": f"${blended['aggressive']:,}"},
+        {"id": field_map["Top Sold Comps"],   "field_value": "\n".join(blended["top_comps"])},
+        {"id": field_map["Comp Confidence"],  "field_value": blended["confidence_note"]},
+        {"id": field_map["Comps Run Date"],   "field_value": today},
     ]
     ghl.update_opportunity_fields(opp_id, updates)
 
@@ -137,29 +217,36 @@ def run_loop(test_opp_id: str = None):
                         continue
 
                     logging.info(f"Running comps for {opp_name} @ {address}")
-                    data, status = rentcast.get_avm(address)
 
-                    if status == "quota":
+                    rc_data, rc_status = rentcast.get_avm(address)
+                    rc_result = None
+                    if rc_status == "quota":
                         logging.warning("RentCast 429 — backing off 30 minutes")
                         time.sleep(1800)
                         break
+                    elif rc_status == "ok":
+                        rc_result, _ = rentcast.compute_arv(rc_data)
+                    else:
+                        logging.warning(f"RentCast {rc_status} for {opp_name}")
 
-                    if status == "not_found":
-                        logging.warning(f"RentCast 404 for {opp_name} @ {address}")
-                        ghl.update_opportunity_fields(opp_id, [
-                            {"id": field_map["Comp Confidence"], "field_value": "RentCast: address not found"},
-                            {"id": field_map["Comps Run Date"], "field_value": datetime.utcnow().strftime("%Y-%m-%d")},
-                        ])
+                    logging.info(f"  Calling ChatARV...")
+                    ca_data, ca_status = chatarv.get_comps(address)
+                    ca_result = None
+                    if ca_status == "quota":
+                        logging.warning("ChatARV quota exhausted")
+                    elif ca_status == "ok":
+                        ca_result = chatarv.extract_arv(ca_data)
+                    else:
+                        logging.warning(f"ChatARV {ca_status} for {opp_name}")
+
+                    blended = blend_arv(ca_result, rc_result)
+                    if not blended["balanced"]:
+                        logging.error(f"No ARV data from any source for {opp_name}")
                         continue
 
-                    result, err = rentcast.compute_arv(data)
-                    if err:
-                        logging.error(f"ARV error for {opp_name}: {err}")
-                        continue
-
-                    write_results_to_opp(opp_id, result, field_map)
+                    write_results_to_opp(opp_id, blended, field_map)
                     today = datetime.utcnow().strftime("%Y-%m-%d")
-                    note_body = ghl.build_arv_note(result, address, today)
+                    note_body = ghl.build_arv_note(blended, address, today)
                     contact_id = opp.get("contactId")
                     if contact_id:
                         try:
@@ -170,7 +257,7 @@ def run_loop(test_opp_id: str = None):
                                 logging.info(f"  Note already exists today for {contact_id}, skipping")
                         except Exception as ne:
                             logging.warning(f"  Note write failed: {ne}")
-                    logging.info(f"  Conservative: ${result['conservative']:,} | Balanced: ${result['balanced']:,} | Aggressive: ${result['aggressive']:,}")
+                    logging.info(f"  Conservative: ${blended['conservative']:,} | Balanced: ${blended['balanced']:,} | Aggressive: ${blended['aggressive']:,} | Sources: {list(blended['sources'].keys())}")
                     total_processed += 1
 
                 if len(opps) < 100:
@@ -185,6 +272,105 @@ def run_loop(test_opp_id: str = None):
         time.sleep(poll_interval)
 
 
+def process_opportunity_now(opp_id: str):
+    """Run comps on a single opportunity immediately — called by webhook."""
+    try:
+        field_map = get_field_map()
+        opp_data = ghl.get_opportunity(opp_id)
+        if not opp_data:
+            logging.warning(f"Webhook: opportunity {opp_id} not found")
+            return
+
+        contact_id = opp_data.get("contactId")
+        if contact_id:
+            try:
+                contact = ghl.get_contact(contact_id)
+                opp_data["_contact"] = contact
+            except Exception:
+                pass
+
+        address = ghl.extract_address(opp_data)
+        opp_name = opp_data.get("name", opp_id)
+
+        if not address:
+            logging.warning(f"Webhook: no address for {opp_name}")
+            ghl.update_opportunity_fields(opp_id, [
+                {"id": field_map["Comp Confidence"], "field_value": "Skipped: no address found"},
+                {"id": field_map["Comps Run Date"], "field_value": datetime.utcnow().strftime("%Y-%m-%d")},
+            ])
+            return
+
+        logging.info(f"Webhook: running comps for {opp_name} @ {address}")
+        data, status = rentcast.get_avm(address)
+
+        if status == "quota":
+            logging.warning("Webhook: RentCast 429 — quota exhausted")
+            return
+        if status == "not_found":
+            logging.warning(f"Webhook: RentCast 404 for {address}")
+            ghl.update_opportunity_fields(opp_id, [
+                {"id": field_map["Comp Confidence"], "field_value": "RentCast: address not found"},
+                {"id": field_map["Comps Run Date"], "field_value": datetime.utcnow().strftime("%Y-%m-%d")},
+            ])
+            return
+
+        result, err = rentcast.compute_arv(data)
+        if err:
+            logging.error(f"Webhook: ARV error for {opp_name}: {err}")
+            return
+
+        write_results_to_opp(opp_id, result, field_map)
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        note_body = ghl.build_arv_note(result, address, today)
+        if contact_id and not ghl.arv_note_exists_today(contact_id, today):
+            ghl.add_contact_note(contact_id, note_body)
+        logging.info(f"Webhook: done — Conservative: ${result['conservative']:,} | Balanced: ${result['balanced']:,}")
+
+    except Exception as e:
+        logging.error(f"Webhook processing error for {opp_id}: {e}", exc_info=True)
+
+
+@app.route("/webhook/ghl", methods=["POST"])
+def ghl_webhook():
+    payload = request.get_json(silent=True) or {}
+    logging.info(f"Webhook received: {str(payload)[:200]}")
+
+    opp_id = (
+        payload.get("id")
+        or payload.get("opportunityId")
+        or (payload.get("opportunity") or {}).get("id")
+    )
+    stage_id = (
+        payload.get("pipelineStageId")
+        or (payload.get("opportunity") or {}).get("pipelineStageId")
+    )
+
+    target_stage = os.environ.get("TARGET_STAGE_ID", "74cdaa01-d170-4b5e-a9dd-3714c24bdf5a")
+
+    if not opp_id:
+        return jsonify({"status": "ignored", "reason": "no opportunity id"}), 200
+
+    if stage_id and stage_id != target_stage:
+        return jsonify({"status": "ignored", "reason": "wrong stage"}), 200
+
+    threading.Thread(target=process_opportunity_now, args=(opp_id,), daemon=True).start()
+    return jsonify({"status": "processing", "opportunityId": opp_id}), 200
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok"}), 200
+
+
+def run_server_and_loop():
+    """Start daily poll loop in background, Flask webhook server in foreground."""
+    loop_thread = threading.Thread(target=run_loop, daemon=True)
+    loop_thread.start()
+    port = int(os.environ.get("PORT", 8080))
+    logging.info(f"Webhook server starting on port {port}")
+    app.run(host="0.0.0.0", port=port)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="ARV Automation")
     sub = parser.add_subparsers(dest="cmd")
@@ -194,8 +380,10 @@ if __name__ == "__main__":
     p_addr.add_argument("--repairs", type=float, default=None)
     p_addr.add_argument("--fee", type=float, default=None)
 
-    p_loop = sub.add_parser("run", help="Start the automation loop")
+    p_loop = sub.add_parser("run", help="Start the automation loop (no webhook server)")
     p_loop.add_argument("--test-opp", default=None, help="Only process this one GHL opportunity ID")
+
+    sub.add_parser("serve", help="Start webhook server + daily poll loop (production mode)")
 
     p_setup = sub.add_parser("setup", help="Discover pipeline/stage IDs and create custom fields")
 
@@ -205,6 +393,8 @@ if __name__ == "__main__":
         run_one_address(args.address, args.repairs, args.fee)
     elif args.cmd == "run":
         run_loop(test_opp_id=args.test_opp)
+    elif args.cmd == "serve":
+        run_server_and_loop()
     elif args.cmd == "setup":
         pipeline_id, stage_id, pname, sname = ghl.find_pipeline_and_stage(
             os.environ["TARGET_PIPELINE_NAME"], os.environ["TARGET_STAGE_NAME"]

@@ -53,6 +53,18 @@ def get_opportunities(pipeline_id: str, stage_id: str, limit=100, page=1):
     return data.get("opportunities", []), data.get("meta", {})
 
 
+def get_opportunity(opp_id: str):
+    r = requests.get(
+        f"{BASE}/opportunities/{opp_id}",
+        headers=HEADERS(),
+        verify=VERIFY_SSL,
+    )
+    if r.status_code == 404:
+        return None
+    r.raise_for_status()
+    return r.json().get("opportunity", r.json())
+
+
 def get_contact(contact_id: str):
     r = requests.get(
         f"{BASE}/contacts/{contact_id}",
@@ -151,22 +163,26 @@ def p(text: str) -> str:
     return f'<p style="padding-left: 0px!important;">{text}</p>'
 
 
-def build_arv_note(result: dict, address: str, run_date: str) -> str:
-    conservative = f"${result['conservative']:,}" if result.get('conservative') else "N/A"
-    balanced     = f"${result['balanced']:,}"     if result.get('balanced')     else "N/A"
-    aggressive   = f"${result['aggressive']:,}"   if result.get('aggressive')   else "N/A"
+def build_arv_note(blended: dict, address: str, run_date: str) -> str:
+    conservative = f"${blended['conservative']:,}" if blended.get('conservative') else "N/A"
+    balanced     = f"${blended['balanced']:,}"     if blended.get('balanced')     else "N/A"
+    aggressive   = f"${blended['aggressive']:,}"   if blended.get('aggressive')   else "N/A"
 
-    comps_lines = result.get("top_comps") or ["No comps — AVM fallback used"]
+    comps_lines = blended.get("top_comps") or ["No comps available"]
+
+    chatarv_arv = f"${blended['chatarv_arv']:,}" if blended.get('chatarv_arv') else "(pending)"
+    chatarv_conf = f" (confidence {blended['chatarv_confidence']}%)" if blended.get('chatarv_confidence') else ""
+    rentcast_arv = f"${blended['rentcast_arv']:,}" if blended.get('rentcast_arv') else "(pending)"
 
     lines = [
         p(f"<strong><u>COMPS — Auto-Generated {run_date}</u></strong>"),
         p(f"<strong>Address:</strong> {address}"),
         p(""),
         p(f"<strong>ARV Conservative:</strong> {conservative}"),
-        p(f"<strong>ARV Balanced:</strong> {balanced}"),
+        p(f"<strong>ARV Balanced (Blended):</strong> {balanced}"),
         p(f"<strong>ARV Aggressive:</strong> {aggressive}"),
         p(""),
-        p(f"<strong>Confidence:</strong> {result.get('confidence', 'N/A')}"),
+        p(f"<strong>Confidence:</strong> {blended.get('confidence_note', 'N/A')}"),
         p(""),
         p("<strong>--- Top Comps ---</strong>"),
     ]
@@ -176,10 +192,9 @@ def build_arv_note(result: dict, address: str, run_date: str) -> str:
     lines += [
         p(""),
         p("<strong>--- COMPS by Source ---</strong>"),
-        p(f"RentCast ARV: {balanced}"),
-        p("ChatARV $: (pending API)"),
-        p("PropStream ARV $: (pending API)"),
-        p("BatchData ARV $: (pending API)"),
+        p(f"ChatARV ARV: {chatarv_arv}{chatarv_conf}"),
+        p(f"RentCast ARV: {rentcast_arv}"),
+        p("BatchData ARV: (pending API)"),
     ]
 
     return "".join(lines)
