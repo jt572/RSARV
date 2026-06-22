@@ -26,6 +26,65 @@ def get_field_map():
         _field_map_cache.update(ghl.ensure_custom_fields())
     return _field_map_cache
 
+
+def get_env_list(name: str, fallback: str | None = None) -> list[str]:
+    """Return a comma-separated environment variable as a clean list."""
+    raw = os.environ.get(name, fallback or "")
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def unique_list(items: list[str]) -> list[str]:
+    """Preserve order while removing duplicates."""
+    seen = set()
+    result = []
+    for item in items:
+        if item not in seen:
+            seen.add(item)
+            result.append(item)
+    return result
+
+
+def get_target_stage_names() -> list[str]:
+    """
+    Support JT's requested trigger stages without removing the legacy Run Comps path.
+
+    Preferred .env format:
+      TARGET_STAGE_NAMES=New Lead (Untouched),Run Comps
+
+    Backward compatible .env format:
+      TARGET_STAGE_NAME=Run Comps
+
+    If only TARGET_STAGE_NAME exists, New Lead (Untouched) is added automatically.
+    """
+    names = get_env_list("TARGET_STAGE_NAMES")
+    if names:
+        return unique_list(names)
+
+    legacy = os.environ.get("TARGET_STAGE_NAME", "Run Comps")
+    return unique_list(["New Lead (Untouched)", legacy])
+
+
+def get_target_stage_ids() -> list[str]:
+    """
+    Support multiple webhook stage IDs.
+
+    Preferred .env format:
+      TARGET_STAGE_IDS=new_lead_stage_id,run_comps_stage_id
+
+    Backward compatible .env format:
+      TARGET_STAGE_ID=run_comps_stage_id
+    """
+    ids = get_env_list("TARGET_STAGE_IDS")
+    if ids:
+        return unique_list(ids)
+
+    legacy = os.environ.get("TARGET_STAGE_ID")
+    if legacy:
+        return [legacy]
+
+    # Legacy hardcoded Run Comps stage ID. Keep this as a fallback so existing deployments do not break.
+    return ["74cdaa01-d170-4b5e-a9dd-3714c24bdf5a"]
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
@@ -157,15 +216,28 @@ def run_loop(test_opp_id: str = None):
     cooldown_days = int(os.environ.get("RERUN_COOLDOWN_DAYS", 3))
     poll_interval = int(os.environ.get("POLL_INTERVAL_SECONDS", 60))
 
-    logging.info("Discovering pipeline and stage...")
-    pipeline_id, stage_id, pipeline_name, stage_name = ghl.find_pipeline_and_stage(
-        os.environ["TARGET_PIPELINE_NAME"], os.environ["TARGET_STAGE_NAME"]
-    )
-    if not pipeline_id:
-        logging.error("Pipeline/stage not found. Check TARGET_PIPELINE_NAME and TARGET_STAGE_NAME in .env")
+    logging.info("Discovering pipeline and target stages...")
+
+    target_stages = []
+    for target_stage_name in get_target_stage_names():
+        pipeline_id, stage_id, pipeline_name, stage_name = ghl.find_pipeline_and_stage(
+            os.environ["TARGET_PIPELINE_NAME"], target_stage_name
+        )
+        if pipeline_id and stage_id:
+            target_stages.append({
+                "pipeline_id": pipeline_id,
+                "stage_id": stage_id,
+                "pipeline_name": pipeline_name,
+                "stage_name": stage_name,
+            })
+            logging.info(f"Target stage enabled: {pipeline_name} | {stage_name} ({stage_id})")
+        else:
+            logging.warning(f"Target stage not found: {target_stage_name}")
+
+    if not target_stages:
+        logging.error("No target stages found. Check TARGET_PIPELINE_NAME and TARGET_STAGE_NAMES in .env")
         return
 
-    logging.info(f"Pipeline: {pipeline_name} | Stage: {stage_name}")
     logging.info("Ensuring custom fields exist...")
     field_map = ghl.ensure_custom_fields()
 
@@ -175,94 +247,106 @@ def run_loop(test_opp_id: str = None):
     while True:
         try:
             logging.info("Starting sweep...")
-            page = 1
             total_processed = 0
+            stop_current_sweep = False
 
-            while True:
-                opps, meta = ghl.get_opportunities(pipeline_id, stage_id, limit=100, page=page)
-                if not opps:
+            for target in target_stages:
+                if stop_current_sweep:
                     break
 
-                if page == 1:
-                    total = meta.get("total", len(opps))
-                    logging.info(f"Deals in stage: {total}")
+                pipeline_id = target["pipeline_id"]
+                stage_id = target["stage_id"]
+                stage_name = target["stage_name"]
+                page = 1
 
-                for opp in opps:
-                    opp_id = opp["id"]
-                    opp_name = opp.get("name", opp_id)
+                logging.info(f"Scanning stage: {stage_name}")
 
-                    if test_opp_id and opp_id != test_opp_id:
-                        continue
-
-                    last_run = get_comps_run_date(opp, field_map)
-                    if last_run and (datetime.utcnow() - last_run).days < cooldown_days:
-                        logging.info(f"Skipping {opp_name} — ran {(datetime.utcnow()-last_run).days}d ago")
-                        continue
-
-                    contact_id = opp.get("contactId")
-                    if contact_id:
-                        try:
-                            contact = ghl.get_contact(contact_id)
-                            opp["_contact"] = contact
-                        except Exception as e:
-                            logging.warning(f"Could not fetch contact for {opp_name}: {e}")
-
-                    address = ghl.extract_address(opp)
-                    if not address:
-                        logging.warning(f"No address found for {opp_name} — skipping")
-                        ghl.update_opportunity_fields(opp_id, [
-                            {"id": field_map["Comp Confidence"], "field_value": "Skipped: no address found"},
-                            {"id": field_map["Comps Run Date"], "field_value": datetime.utcnow().strftime("%Y-%m-%d")},
-                        ])
-                        continue
-
-                    logging.info(f"Running comps for {opp_name} @ {address}")
-
-                    rc_data, rc_status = rentcast.get_avm(address)
-                    rc_result = None
-                    if rc_status == "quota":
-                        logging.warning("RentCast 429 — backing off 30 minutes")
-                        time.sleep(1800)
+                while True:
+                    opps, meta = ghl.get_opportunities(pipeline_id, stage_id, limit=100, page=page)
+                    if not opps:
                         break
-                    elif rc_status == "ok":
-                        rc_result, _ = rentcast.compute_arv(rc_data)
-                    else:
-                        logging.warning(f"RentCast {rc_status} for {opp_name}")
 
-                    logging.info(f"  Calling ChatARV...")
-                    ca_data, ca_status = chatarv.get_comps(address)
-                    ca_result = None
-                    if ca_status == "quota":
-                        logging.warning("ChatARV quota exhausted")
-                    elif ca_status == "ok":
-                        ca_result = chatarv.extract_arv(ca_data)
-                    else:
-                        logging.warning(f"ChatARV {ca_status} for {opp_name}")
+                    if page == 1:
+                        total = meta.get("total", len(opps))
+                        logging.info(f"Deals in {stage_name}: {total}")
 
-                    blended = blend_arv(ca_result, rc_result)
-                    if not blended["balanced"]:
-                        logging.error(f"No ARV data from any source for {opp_name}")
-                        continue
+                    for opp in opps:
+                        opp_id = opp["id"]
+                        opp_name = opp.get("name", opp_id)
 
-                    write_results_to_opp(opp_id, blended, field_map)
-                    today = datetime.utcnow().strftime("%Y-%m-%d")
-                    note_body = ghl.build_arv_note(blended, address, today)
-                    contact_id = opp.get("contactId")
-                    if contact_id:
-                        try:
-                            if not ghl.arv_note_exists_today(contact_id, today):
-                                ghl.add_contact_note(contact_id, note_body)
-                                logging.info(f"  Note written to contact {contact_id}")
-                            else:
-                                logging.info(f"  Note already exists today for {contact_id}, skipping")
-                        except Exception as ne:
-                            logging.warning(f"  Note write failed: {ne}")
-                    logging.info(f"  Conservative: ${blended['conservative']:,} | Balanced: ${blended['balanced']:,} | Aggressive: ${blended['aggressive']:,} | Sources: {list(blended['sources'].keys())}")
-                    total_processed += 1
+                        if test_opp_id and opp_id != test_opp_id:
+                            continue
 
-                if len(opps) < 100:
-                    break
-                page += 1
+                        last_run = get_comps_run_date(opp, field_map)
+                        if last_run and (datetime.utcnow() - last_run).days < cooldown_days:
+                            logging.info(f"Skipping {opp_name} — ran {(datetime.utcnow()-last_run).days}d ago")
+                            continue
+
+                        contact_id = opp.get("contactId")
+                        if contact_id:
+                            try:
+                                contact = ghl.get_contact(contact_id)
+                                opp["_contact"] = contact
+                            except Exception as e:
+                                logging.warning(f"Could not fetch contact for {opp_name}: {e}")
+
+                        address = ghl.extract_address(opp)
+                        if not address:
+                            logging.warning(f"No address found for {opp_name} — skipping")
+                            ghl.update_opportunity_fields(opp_id, [
+                                {"id": field_map["Comp Confidence"], "field_value": "Skipped: no address found"},
+                                {"id": field_map["Comps Run Date"], "field_value": datetime.utcnow().strftime("%Y-%m-%d")},
+                            ])
+                            continue
+
+                        logging.info(f"Running comps for {opp_name} @ {address} | Trigger stage: {stage_name}")
+
+                        rc_data, rc_status = rentcast.get_avm(address)
+                        rc_result = None
+                        if rc_status == "quota":
+                            logging.warning("RentCast 429 — backing off 30 minutes")
+                            time.sleep(1800)
+                            stop_current_sweep = True
+                            break
+                        elif rc_status == "ok":
+                            rc_result, _ = rentcast.compute_arv(rc_data)
+                        else:
+                            logging.warning(f"RentCast {rc_status} for {opp_name}")
+
+                        logging.info(f"  Calling ChatARV...")
+                        ca_data, ca_status = chatarv.get_comps(address)
+                        ca_result = None
+                        if ca_status == "quota":
+                            logging.warning("ChatARV quota exhausted")
+                        elif ca_status == "ok":
+                            ca_result = chatarv.extract_arv(ca_data)
+                        else:
+                            logging.warning(f"ChatARV {ca_status} for {opp_name}")
+
+                        blended = blend_arv(ca_result, rc_result)
+                        if not blended["balanced"]:
+                            logging.error(f"No ARV data from any source for {opp_name}")
+                            continue
+
+                        write_results_to_opp(opp_id, blended, field_map)
+                        today = datetime.utcnow().strftime("%Y-%m-%d")
+                        note_body = ghl.build_arv_note(blended, address, today)
+                        contact_id = opp.get("contactId")
+                        if contact_id:
+                            try:
+                                if not ghl.arv_note_exists_today(contact_id, today):
+                                    ghl.add_contact_note(contact_id, note_body)
+                                    logging.info(f"  Note written to contact {contact_id}")
+                                else:
+                                    logging.info(f"  Note already exists today for {contact_id}, skipping")
+                            except Exception as ne:
+                                logging.warning(f"  Note write failed: {ne}")
+                        logging.info(f"  Conservative: ${blended['conservative']:,} | Balanced: ${blended['balanced']:,} | Aggressive: ${blended['aggressive']:,} | Sources: {list(blended['sources'].keys())}")
+                        total_processed += 1
+
+                    if stop_current_sweep or len(opps) < 100:
+                        break
+                    page += 1
 
             logging.info(f"Sweep done. Processed {total_processed} deal(s). Sleeping {poll_interval}s.")
 
@@ -345,12 +429,12 @@ def ghl_webhook():
         or (payload.get("opportunity") or {}).get("pipelineStageId")
     )
 
-    target_stage = os.environ.get("TARGET_STAGE_ID", "74cdaa01-d170-4b5e-a9dd-3714c24bdf5a")
+    target_stage_ids = get_target_stage_ids()
 
     if not opp_id:
         return jsonify({"status": "ignored", "reason": "no opportunity id"}), 200
 
-    if stage_id and stage_id != target_stage:
+    if stage_id and target_stage_ids and stage_id not in target_stage_ids:
         return jsonify({"status": "ignored", "reason": "wrong stage"}), 200
 
     threading.Thread(target=process_opportunity_now, args=(opp_id,), daemon=True).start()
@@ -396,17 +480,24 @@ if __name__ == "__main__":
     elif args.cmd == "serve":
         run_server_and_loop()
     elif args.cmd == "setup":
-        pipeline_id, stage_id, pname, sname = ghl.find_pipeline_and_stage(
-            os.environ["TARGET_PIPELINE_NAME"], os.environ["TARGET_STAGE_NAME"]
-        )
-        if pipeline_id:
-            print(f"Pipeline: {pname} ({pipeline_id})")
-            print(f"Stage   : {sname} ({stage_id})")
-        else:
-            print("Pipeline/stage not found.")
+        print("Target stages:")
+        found_any_stage = False
+        for target_stage_name in get_target_stage_names():
+            pipeline_id, stage_id, pname, sname = ghl.find_pipeline_and_stage(
+                os.environ["TARGET_PIPELINE_NAME"], target_stage_name
+            )
+            if pipeline_id:
+                found_any_stage = True
+                print(f"  Pipeline: {pname} ({pipeline_id})")
+                print(f"  Stage   : {sname} ({stage_id})")
+            else:
+                print(f"  Stage not found: {target_stage_name}")
+        if not found_any_stage:
+            print("No target stages found.")
         field_map = ghl.ensure_custom_fields()
         print("Custom fields:")
         for k, v in field_map.items():
             print(f"  {k}: {v}")
     else:
         parser.print_help()
+
